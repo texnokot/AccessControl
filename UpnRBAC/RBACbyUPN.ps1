@@ -20,24 +20,38 @@ OUTPUTS
   - CSV files saved alongside the script or current directory for Exchange_RBAC, Entra_Roles_Assigned, Entra_Roles_Eligible, PIM_Groups_Detailed, PIM_Groups_Compact, and Azure_RBAC datasets. 
 
 PREREQUISITES
+  - PowerShell 7.0 or later is required (the script uses ternary operators and other PS7-only syntax; it will not parse on Windows PowerShell 5.1).
   - Modules: ExchangeOnlineManagement, Microsoft.Graph.Identity.Governance, Microsoft.Graph.Users, Microsoft.Graph.Groups, Microsoft.Graph.Authentication, Az.Accounts, Az.Resources. 
-  - PowerShell 7+ recommended for device code authentication scenarios with the EXO module when no browser is available. 
   - Sufficient permissions to read Exchange RBAC, Graph role management and PIM objects, and Azure RBAC schedules as documented by their respective cmdlets. 
 
 AUTHENTICATION
-  - Exchange Online: Interactive user sign-in; attempts DisableWAM, falls back to device code, then standard interactive.
+  - Exchange Online: Interactive user sign-in; tries standard interactive first, falls back to device code, then DisableWAM (a documented Microsoft workaround for WAM/MSAL compatibility issues, not a first choice).
   - Microsoft Graph (delegated): RoleManagement.Read.Directory; Directory.Read.All; Group.Read.All; PrivilegedEligibilitySchedule.Read.AzureADGroup; PrivilegedAssignmentSchedule.Read.AzureADGroup; PrivilegedAccess.Read.AzureADGroup (admin consent typically required).
-  - Azure (Az): Signed-in user via Connect-AzAccount; enumerates RBAC/PIM using the caller’s effective permissions.
+  - Azure (Az): Signed-in user via Connect-AzAccount; enumerates RBAC/PIM using the caller’s effective permissions. The script verifies the Graph and Az sessions are in the same tenant and warns if not.
 
 LIMITATIONS
   - Exchange section is user-interactive and does not implement app-only authentication, so unattended EXO enumeration is out of scope here. 
   - Visibility is constrained by the signed-in principal’s effective permissions; cmdlets return only data authorized for the caller. 
   - PIM for Groups data availability depends on Graph delegated permissions sufficient to read group-based assignment and eligibility schedules. 
   - The report focuses on Exchange RBAC and does not enumerate per-mailbox permissions beyond what ManagementRoleAssignment exposes. 
+  - Non-fatal errors (failed lookups, throttled calls, etc.) are collected and surfaced in a dedicated "Collection Warnings/Errors" section of the report instead of being silently swallowed.
 #>
 
+#Requires -Version 7.0
 
 param()
+
+# Collects non-fatal errors/warnings from throughout the run so they are surfaced in the report
+# instead of being silently discarded by empty catch blocks.
+$script:auditIssues = New-Object System.Collections.Generic.List[object]
+function Add-AuditIssue {
+  param(
+    [Parameter(Mandatory=$true)][string]$Area,
+    [Parameter(Mandatory=$true)][string]$Message
+  )
+  $script:auditIssues.Add([PSCustomObject]@{ Area = $Area; Message = $Message; Timestamp = (Get-Date) })
+  Write-Host ("[{0}] {1}" -f $Area, $Message) -ForegroundColor DarkYellow
+}
 
 # -------------------- Input with guard --------------------
 $upn = Read-Host "Enter User Principal Name (UPN)"
@@ -59,7 +73,7 @@ if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
   try {
     Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force -ErrorAction Stop
   } catch {
-    Write-Host ("Failed to install ExchangeOnlineManagement: {0}" -f $_.Exception.Message) -ForegroundColor Red  
+    Add-AuditIssue -Area 'Exchange' -Message ("Failed to install ExchangeOnlineManagement: {0}" -f $_.Exception.Message)
   }
 }
 $workloadRbac = @()
@@ -67,17 +81,20 @@ $workloadRbac = @()
 if (Get-Module -ListAvailable -Name ExchangeOnlineManagement) {
   Import-Module ExchangeOnlineManagement -ErrorAction Stop  
 
-  # Interactive connection sequence: DisableWAM -> Device -> plain 
+  # Interactive connection sequence: plain interactive -> Device -> DisableWAM.
+  # DisableWAM is a documented Microsoft workaround for WAM/MSAL compatibility issues
+  # (see "Resolve issues in Exchange Online PowerShell after WAM integration") and
+  # should be attempted last, not first.
   function Connect-EXO-Interactive {
     try {
-      Connect-ExchangeOnline -DisableWAM -ShowBanner:$false -ErrorAction Stop
+      Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
       return
     } catch {
       try {
         Connect-ExchangeOnline -Device -ShowBanner:$false -ErrorAction Stop
         return
       } catch {
-        Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+        Connect-ExchangeOnline -DisableWAM -ShowBanner:$false -ErrorAction Stop
         return
       }
     }
@@ -86,95 +103,79 @@ if (Get-Module -ListAvailable -Name ExchangeOnlineManagement) {
   try {
     Connect-EXO-Interactive
 
-    # Helper: robust member match for UPN in role group members 
-    function Test-MemberMatch {
-      param(
-        [Parameter(Mandatory=$true)]$Member,
-        [Parameter(Mandatory=$true)][string]$Upn
-      )
-      $candidates = @()
-      foreach ($p in 'PrimarySmtpAddress','ExternalDirectoryObjectId','WindowsLiveID','Name','DisplayName','Alias','Identity','UserPrincipalName','SamAccountName') {
-        if ($Member.PSObject.Properties[$p]) {
-          $val = [string]$Member.$p
-          if (-not [string]::IsNullOrWhiteSpace($val)) { $candidates += $val }
+    # Resolve effective Exchange RBAC for the user in a single call. -GetEffectiveUsers
+    # expands role-group and USG membership (including nested groups) server-side,
+    # which is far more reliable than manually enumerating Get-RoleGroupMember results
+    # and string-matching identity properties.
+    Write-Host "Resolving effective Exchange RBAC for $upn ..." -ForegroundColor Cyan
+    $effectiveAssigns = @()
+    try {
+      $effectiveAssigns = Get-ManagementRoleAssignment -GetEffectiveUsers -ErrorAction Stop |
+        Where-Object {
+          $_.EffectiveUserName -and ($_.EffectiveUserName -ieq $upn)
         }
-      }
-      return ($candidates | Where-Object { $_ -and ($_ -ieq $Upn) }) -ne $null
+    } catch {
+      Add-AuditIssue -Area 'Exchange' -Message ("Get-ManagementRoleAssignment -GetEffectiveUsers failed: {0}" -f $_.Exception.Message)
     }
 
-    # Resolve all role groups containing the user
-    Write-Host "Resolving Exchange role groups for $upn ..." -ForegroundColor Cyan
-    $allRoleGroups = @(); try { $allRoleGroups = Get-RoleGroup -ResultSize Unlimited } catch {}
-    $userRoleGroups = @()
-    foreach ($rg in $allRoleGroups) {
-      try {
-        $members = Get-RoleGroupMember -Identity $rg.Identity -ResultSize Unlimited  # enumerate members 
-        if ($members | Where-Object { Test-MemberMatch -Member $_ -Upn $upn }) {
-          $userRoleGroups += $rg.Identity
-        }
-      } catch {}
-    }
-    $userRoleGroups = $userRoleGroups | Select-Object -Unique
-
-    # Aggregate all ManagementRoleAssignments granted to those groups 
-    foreach ($rg in $userRoleGroups) {
-      try {
-        $rgAssigns = Get-ManagementRoleAssignment -RoleAssignee $rg -ErrorAction Stop  # assignments for role group 
-      } catch { $rgAssigns = @() }
-      foreach ($ar in $rgAssigns) {
-        $scopeText = if ($ar.Scope) { $ar.Scope } elseif ($ar.RecipientWriteScope) { $ar.RecipientWriteScope } else { $ar.ScopeType }
-        $workloadRbac += [PSCustomObject]@{
-          Workload          = 'Exchange'
-          Role              = $ar.Role
-          AssignmentSource  = "Group: $rg"
-          Scope             = $scopeText
-          RoleAssigneeType  = 'RoleGroup'
-          RoleAssigneeName  = $rg
-        }
-      }
-    }
-
-    # Include direct user assignments (if any) 
-    try { $directAssigns = Get-ManagementRoleAssignment -RoleAssignee $upn -ErrorAction Stop } catch { $directAssigns = @() }
-    foreach ($ar in $directAssigns) {
+    foreach ($ar in $effectiveAssigns) {
       $scopeText = if ($ar.Scope) { $ar.Scope } elseif ($ar.RecipientWriteScope) { $ar.RecipientWriteScope } else { $ar.ScopeType }
+      $source = if ($ar.RoleAssigneeType -match 'RoleGroup|USG|SecurityGroup') { "Group: $($ar.RoleAssigneeName)" } else { 'Direct' }
       $workloadRbac += [PSCustomObject]@{
         Workload          = 'Exchange'
         Role              = $ar.Role
-        AssignmentSource  = 'Direct'
+        AssignmentSource  = $source
         Scope             = $scopeText
         RoleAssigneeType  = $ar.RoleAssigneeType
         RoleAssigneeName  = $ar.RoleAssigneeName
       }
     }
+
+    # Fallback: if -GetEffectiveUsers returned nothing (e.g. insufficient permission for
+    # that parameter), still surface any direct assignment to the user so the section
+    # isn't silently empty.
+    if ($workloadRbac.Count -eq 0) {
+      try {
+        $directAssigns = Get-ManagementRoleAssignment -RoleAssignee $upn -ErrorAction Stop
+        foreach ($ar in $directAssigns) {
+          $scopeText = if ($ar.Scope) { $ar.Scope } elseif ($ar.RecipientWriteScope) { $ar.RecipientWriteScope } else { $ar.ScopeType }
+          $workloadRbac += [PSCustomObject]@{
+            Workload          = 'Exchange'
+            Role              = $ar.Role
+            AssignmentSource  = 'Direct'
+            Scope             = $scopeText
+            RoleAssigneeType  = $ar.RoleAssigneeType
+            RoleAssigneeName  = $ar.RoleAssigneeName
+          }
+        }
+      } catch {
+        Add-AuditIssue -Area 'Exchange' -Message ("Fallback direct RBAC query failed: {0}" -f $_.Exception.Message)
+      }
+    }
   } catch {
-    Write-Host ("Exchange Online interactive RBAC query failed: {0}" -f $_.Exception.Message) -ForegroundColor Yellow  
+    Add-AuditIssue -Area 'Exchange' -Message ("Exchange Online interactive RBAC query failed: {0}" -f $_.Exception.Message)
   } finally {
     try { Disconnect-ExchangeOnline -Confirm:$false | Out-Null } catch {}
   }
 } else {
-  Write-Host "ExchangeOnlineManagement is not available; Exchange RBAC section skipped." -ForegroundColor Yellow  
+  Add-AuditIssue -Area 'Exchange' -Message 'ExchangeOnlineManagement is not available; Exchange RBAC section skipped.'
 }
 
 # -------------------- Ensure modules (Graph/Az) --------------------
-# Microsoft Graph targeted submodules (avoid broad Microsoft.Graph) 
-if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
-  Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force
+# Microsoft Graph targeted submodules (avoid broad Microsoft.Graph). These modules are
+# required (unlike ExchangeOnlineManagement above); if installation fails, stop rather
+# than continue into a session that will error on every subsequent cmdlet.
+function Install-RequiredModule([string]$Name) {
+  if (Get-Module -ListAvailable -Name $Name) { return }
+  try {
+    Install-Module $Name -Scope CurrentUser -Force -ErrorAction Stop
+  } catch {
+    throw "Failed to install required module '$Name': $($_.Exception.Message)"
+  }
 }
-if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Users)) {
-  Install-Module Microsoft.Graph.Users -Scope CurrentUser -Force
-}
-if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Identity.Governance)) {
-  Install-Module Microsoft.Graph.Identity.Governance -Scope CurrentUser -Force
-}
-if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Groups)) {
-  Install-Module Microsoft.Graph.Groups -Scope CurrentUser -Force
-}
-if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
-  Install-Module Az.Accounts -Scope CurrentUser -Force
-}
-if (-not (Get-Module -ListAvailable -Name Az.Resources)) {
-  Install-Module Az.Resources -Scope CurrentUser -Force
+
+foreach ($moduleName in 'Microsoft.Graph.Authentication','Microsoft.Graph.Users','Microsoft.Graph.Identity.Governance','Microsoft.Graph.Groups','Az.Accounts','Az.Resources') {
+  Install-RequiredModule -Name $moduleName
 }
 
 # Import required submodules
@@ -197,8 +198,25 @@ Connect-MgGraph -Scopes `
 
 Connect-AzAccount | Out-Null  # no context switching; use -Scope everywhere 
 
-# Resolve user
-$user = Get-MgUser -Filter "userPrincipalName eq '$upn'" -ConsistencyLevel eventual -CountVariable c | Select-Object -First 1  # robust lookup 
+# Verify Graph and Az sessions are in the same tenant; otherwise the report would silently
+# mix directory/PIM data from one tenant with Azure RBAC data from another.
+try {
+  $graphTenantId = (Get-MgContext).TenantId
+  $azTenantId = (Get-AzContext).Tenant.Id
+  if ($graphTenantId -and $azTenantId -and ($graphTenantId -ne $azTenantId)) {
+    Add-AuditIssue -Area 'Auth' -Message ("Graph tenant ({0}) and Az tenant ({1}) do not match; results may be inconsistent." -f $graphTenantId, $azTenantId)
+  }
+} catch {
+  Add-AuditIssue -Area 'Auth' -Message ("Could not verify Graph/Az tenant consistency: {0}" -f $_.Exception.Message)
+}
+
+# Resolve user. -UserId accepts a UPN directly, avoiding manual OData filter escaping.
+$user = $null
+try {
+  $user = Get-MgUser -UserId $upn -ErrorAction Stop
+} catch {
+  Add-AuditIssue -Area 'Entra' -Message ("Get-MgUser failed for {0}: {1}" -f $upn, $_.Exception.Message)
+}
 if ($null -eq $user) {
   Write-Host "User not found in Entra ID; exiting." -ForegroundColor Yellow  # guard
   Disconnect-MgGraph
@@ -211,19 +229,37 @@ Write-Host "`n=== Roles for $($user.DisplayName) <$upn> ===`n" -ForegroundColor 
 # -------------------- Entra ID (directory) roles --------------------
 Write-Host ">> Entra ID (Directory) Roles" -ForegroundColor Magenta
 
+# Cache directory role definitions across sections (Entra roles + group-assigned roles)
+# to avoid repeated Get-MgRoleManagementDirectoryRoleDefinition calls for the same role.
+$directoryRoleDefCache = @{}
+function Resolve-DirectoryRoleDefName([string]$roleDefinitionId) {
+  if ([string]::IsNullOrWhiteSpace($roleDefinitionId)) { return $null }
+  if ($directoryRoleDefCache.ContainsKey($roleDefinitionId)) { return $directoryRoleDefCache[$roleDefinitionId] }
+  try {
+    $rd = Get-MgRoleManagementDirectoryRoleDefinition -UnifiedRoleDefinitionId $roleDefinitionId -ErrorAction Stop
+    $directoryRoleDefCache[$roleDefinitionId] = $rd.DisplayName
+    return $rd.DisplayName
+  } catch {
+    Add-AuditIssue -Area 'Entra' -Message ("Could not resolve role definition {0}: {1}" -f $roleDefinitionId, $_.Exception.Message)
+    return $roleDefinitionId
+  }
+}
+
 $entraAssigned = @()
-$assignedRoles = Get-MgRoleManagementDirectoryRoleAssignment -Filter "principalId eq '$userId'"  
-foreach ($r in ($assignedRoles | ForEach-Object { $_ })) {
-  $rd = Get-MgRoleManagementDirectoryRoleDefinition -UnifiedRoleDefinitionId $r.RoleDefinitionId  # includes custom roles 
-  $entraAssigned += [PSCustomObject]@{ Type='Permanent'; Role=$rd.DisplayName }
+$assignedRoles = @()
+try { $assignedRoles = Get-MgRoleManagementDirectoryRoleAssignment -Filter "principalId eq '$userId'" -All -ErrorAction Stop } catch { Add-AuditIssue -Area 'Entra' -Message ("Failed to read permanent role assignments: {0}" -f $_.Exception.Message) }
+foreach ($r in $assignedRoles) {
+  $roleName = Resolve-DirectoryRoleDefName $r.RoleDefinitionId  # includes custom roles
+  $entraAssigned += [PSCustomObject]@{ Type='Permanent'; Role=$roleName }
 }
 if (-not $entraAssigned) { Write-Host "No permanent Entra ID roles." -ForegroundColor Yellow }  
 
 $entraEligible = @()
-$eligibleRoles = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -Filter "principalId eq '$userId'"  
-foreach ($r in ($eligibleRoles | ForEach-Object { $_ })) {
-  $rd = Get-MgRoleManagementDirectoryRoleDefinition -UnifiedRoleDefinitionId $r.RoleDefinitionId  
-  $entraEligible += [PSCustomObject]@{ Type='Eligible'; Role=$rd.DisplayName }
+$eligibleRoles = @()
+try { $eligibleRoles = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -Filter "principalId eq '$userId'" -All -ErrorAction Stop } catch { Add-AuditIssue -Area 'Entra' -Message ("Failed to read eligible role schedules: {0}" -f $_.Exception.Message) }
+foreach ($r in $eligibleRoles) {
+  $roleName = Resolve-DirectoryRoleDefName $r.RoleDefinitionId
+  $entraEligible += [PSCustomObject]@{ Type='Eligible'; Role=$roleName }
 }
 if (-not $entraEligible) { Write-Host "No eligible Entra ID roles." -ForegroundColor Yellow }  
 
@@ -233,9 +269,10 @@ Write-Host "`n>> PIM Groups & Roles" -ForegroundColor Magenta
 $allGroupEntries = @()
 
 # Eligible schedules for the user (PIM eligible) 
+$eligAll = @()
 try {
-  $eligAll = Get-MgIdentityGovernancePrivilegedAccessGroupEligibilitySchedule -Filter "principalId eq '$userId'" -All
-} catch { $eligAll = @() }
+  $eligAll = Get-MgIdentityGovernancePrivilegedAccessGroupEligibilitySchedule -Filter "principalId eq '$userId'" -All -ErrorAction Stop
+} catch { Add-AuditIssue -Area 'PIM Groups' -Message ("Failed to read group eligibility schedules: {0}" -f $_.Exception.Message) }
 foreach ($e in $eligAll) {
   $allGroupEntries += [PSCustomObject]@{
     GroupId         = $e.GroupId
@@ -244,9 +281,10 @@ foreach ($e in $eligAll) {
 }
 
 # Assignment schedules for the user (PIM active/assigned)
+$assignAll = @()
 try {
-  $assignAll = Get-MgIdentityGovernancePrivilegedAccessGroupAssignmentSchedule -Filter "principalId eq '$userId'" -All
-} catch { $assignAll = @() }
+  $assignAll = Get-MgIdentityGovernancePrivilegedAccessGroupAssignmentSchedule -Filter "principalId eq '$userId'" -All -ErrorAction Stop
+} catch { Add-AuditIssue -Area 'PIM Groups' -Message ("Failed to read group assignment schedules: {0}" -f $_.Exception.Message) }
 foreach ($a in $assignAll) {
   $allGroupEntries += [PSCustomObject]@{
     GroupId         = $a.GroupId
@@ -254,10 +292,13 @@ foreach ($a in $assignAll) {
   }
 }
 
-# Include static group membership (non-PIM) for completeness 
+# Include group membership (non-PIM) for completeness. Transitive membership is used so
+# that nested groups (user -> group A -> group B) are captured, not just direct membership,
+# since nested membership also affects inherited Entra/Azure roles.
+$directGroups = @()
 try {
-  $directGroups = Get-MgUserMemberOf -UserId $userId -All | Where-Object { $_.'@odata.type' -eq "#microsoft.graph.group" }
-} catch { $directGroups = @() }
+  $directGroups = Get-MgUserTransitiveMemberOfAsGroup -UserId $userId -All -ErrorAction Stop
+} catch { Add-AuditIssue -Area 'PIM Groups' -Message ("Failed to read transitive group membership: {0}" -f $_.Exception.Message) }
 foreach ($g in $directGroups) {
   $allGroupEntries += [PSCustomObject]@{
     GroupId         = $g.Id
@@ -272,49 +313,33 @@ foreach ($gid in $allUserGroupIds) {
   try {
     $grp = Get-MgGroup -GroupId $gid -ErrorAction Stop
     $groupNameById[$gid] = $grp.DisplayName
-  } catch { }
+  } catch {
+    Add-AuditIssue -Area 'PIM Groups' -Message ("Failed to resolve group name for {0}: {1}" -f $gid, $_.Exception.Message)
+  }
 }
 
 $allGroupEntries = $allGroupEntries | Sort-Object GroupId, MembershipState -Unique
 if (-not $allGroupEntries) {
   Write-Host "No PIM group memberships or group memberships found." -ForegroundColor Yellow
-} else {
-  foreach ($entry in $allGroupEntries) {
-    $gname = $groupNameById[$entry.GroupId]; if (-not $gname) { $gname = $entry.GroupId }
-    Write-Host "`nGroup: $gname — MembershipState: $($entry.MembershipState)" -ForegroundColor Cyan
-
-    # Show Entra directory roles assigned to the group (if any) 
-    $grpAssigned = Get-MgRoleManagementDirectoryRoleAssignment -Filter "principalId eq '$($entry.GroupId)'"
-    $grpEligible = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -Filter "principalId eq '$($entry.GroupId)'"
-
-    if ($grpAssigned) {
-      foreach ($r in $grpAssigned) {
-        $rd = Get-MgRoleManagementDirectoryRoleDefinition -UnifiedRoleDefinitionId $r.RoleDefinitionId
-        Write-Output (" GroupPermanentRole: {0}" -f $rd.DisplayName)
-      }
-    }
-    if ($grpEligible) {
-      foreach ($r in $grpEligible) {
-        $rd = Get-MgRoleManagementDirectoryRoleDefinition -UnifiedRoleDefinitionId $r.RoleDefinitionId
-        Write-Output (" GroupEligibleRole: {0}" -f $rd.DisplayName)
-      }
-    }
-    if (-not ($grpAssigned -or $grpEligible)) {
-      Write-Host "  (No Entra ID role assignments on this group)" -ForegroundColor Yellow
-    }
-  }
 }
 
-# Build structured rows for HTML from the PIM groups discovered above
+# Build structured rows for HTML from the PIM groups discovered above. Each group's role
+# assignments/eligibilities are fetched exactly once (previously this was fetched twice:
+# once for console display, once for the HTML rows).
 $pimGroupRows = New-Object System.Collections.Generic.List[object]
 foreach ($entry in $allGroupEntries) {
   $gname = if ($groupNameById.ContainsKey($entry.GroupId)) { $groupNameById[$entry.GroupId] } else { $entry.GroupId }
-  $grpAssigned = @(); try { $grpAssigned = Get-MgRoleManagementDirectoryRoleAssignment -Filter "principalId eq '$($entry.GroupId)'" } catch {}
-  $grpEligible = @(); try { $grpEligible = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -Filter "principalId eq '$($entry.GroupId)'" } catch {}
+  Write-Host "`nGroup: $gname — MembershipState: $($entry.MembershipState)" -ForegroundColor Cyan
+
+  $grpAssigned = @()
+  $grpEligible = @()
+  try { $grpAssigned = Get-MgRoleManagementDirectoryRoleAssignment -Filter "principalId eq '$($entry.GroupId)'" -All -ErrorAction Stop } catch { Add-AuditIssue -Area 'PIM Groups' -Message ("Failed to read permanent roles for group {0}: {1}" -f $gname, $_.Exception.Message) }
+  try { $grpEligible = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -Filter "principalId eq '$($entry.GroupId)'" -All -ErrorAction Stop } catch { Add-AuditIssue -Area 'PIM Groups' -Message ("Failed to read eligible roles for group {0}: {1}" -f $gname, $_.Exception.Message) }
 
   if ($grpAssigned -and $grpAssigned.Count -gt 0) {
     foreach ($r in $grpAssigned) {
-      try { $rd = Get-MgRoleManagementDirectoryRoleDefinition -UnifiedRoleDefinitionId $r.RoleDefinitionId; $roleName=$rd.DisplayName } catch { $roleName=$r.RoleDefinitionId }
+      $roleName = Resolve-DirectoryRoleDefName $r.RoleDefinitionId
+      Write-Output (" GroupPermanentRole: {0}" -f $roleName)
       $pimGroupRows.Add([pscustomobject]@{
         GroupName       = $gname
         GroupId         = $entry.GroupId
@@ -326,7 +351,8 @@ foreach ($entry in $allGroupEntries) {
   }
   if ($grpEligible -and $grpEligible.Count -gt 0) {
     foreach ($r in $grpEligible) {
-      try { $rd = Get-MgRoleManagementDirectoryRoleDefinition -UnifiedRoleDefinitionId $r.RoleDefinitionId; $roleName=$rd.DisplayName } catch { $roleName=$r.RoleDefinitionId }
+      $roleName = Resolve-DirectoryRoleDefName $r.RoleDefinitionId
+      Write-Output (" GroupEligibleRole: {0}" -f $roleName)
       $pimGroupRows.Add([pscustomobject]@{
         GroupName       = $gname
         GroupId         = $entry.GroupId
@@ -337,6 +363,7 @@ foreach ($entry in $allGroupEntries) {
     }
   }
   if ((-not $grpAssigned -or $grpAssigned.Count -eq 0) -and (-not $grpEligible -or $grpEligible.Count -eq 0)) {
+    Write-Host "  (No Entra ID role assignments on this group)" -ForegroundColor Yellow
     $pimGroupRows.Add([pscustomobject]@{
       GroupName       = $gname
       GroupId         = $entry.GroupId
@@ -378,7 +405,8 @@ if ($pimGroupUnique.Count -gt 0) {
 # -------------------- Azure RBAC + Azure PIM --------------------
 Write-Host "`n>> Azure RBAC Roles (all scopes with PIM group detection)" -ForegroundColor Magenta  
 
-$subscriptions = Get-AzSubscription  # enumerate without selecting context 
+$subscriptions = @()
+try { $subscriptions = Get-AzSubscription -ErrorAction Stop } catch { Add-AuditIssue -Area 'Azure RBAC' -Message ("Failed to enumerate subscriptions: {0}" -f $_.Exception.Message) }
 $subNameById = @{}; foreach ($s in $subscriptions) { $subNameById[$s.Id.ToString().ToLower()] = $s.Name }
 
 $roleDefNameById = @{}
@@ -389,7 +417,12 @@ function Resolve-RoleDefName([string]$roleDefId) {
   if ($m.Success) { $guid = $m.Groups[1].Value }
   $key = $guid.ToLower()
   if ($roleDefNameById.ContainsKey($key)) { return $roleDefNameById[$key] }
-  try { $rd = Get-AzRoleDefinition -Id $guid -ErrorAction Stop; if ($rd -and $rd.Name) { $roleDefNameById[$key] = $rd.Name; return $rd.Name } } catch {}
+  try {
+    $rd = Get-AzRoleDefinition -Id $guid -ErrorAction Stop
+    if ($rd -and $rd.Name) { $roleDefNameById[$key] = $rd.Name; return $rd.Name }
+  } catch {
+    Add-AuditIssue -Area 'Azure RBAC' -Message ("Could not resolve role definition {0}: {1}" -f $guid, $_.Exception.Message)
+  }
   return $null
 }
 
@@ -411,84 +444,103 @@ function Get-AppliedAt ([string]$scope) {
 
 $rbacOutput = New-Object System.Collections.Generic.List[object]
 
-# Tenant root (direct only)
-try { $tenantAssignments = Get-AzRoleAssignment -ObjectId $userId -Scope "/" -ErrorAction Stop } catch { $tenantAssignments = @() }
+# Classifies a classic Get-AzRoleAssignment result as "Direct" or via a group the user
+# belongs to (works across Az module versions that expose either PrincipalId or ObjectId).
+function Get-AzRoleAssignmentSource($ar) {
+  $principalId = if ($ar.PSObject.Properties.Match('PrincipalId').Count -gt 0) { $ar.PrincipalId } elseif ($ar.PSObject.Properties.Match('ObjectId').Count -gt 0) { $ar.ObjectId } else { $null }
+  if ($principalId -and $allUserGroupIds -and ($allUserGroupIds -contains $principalId)) {
+    $grpName = $groupNameById[$principalId]; if (-not $grpName) { $grpName = $principalId }
+    return "Group: $grpName"
+  }
+  return 'Direct'
+}
+
+# Tenant root (direct + group-inherited via -ExpandPrincipalGroups)
+$tenantAssignments = @()
+try { $tenantAssignments = Get-AzRoleAssignment -ObjectId $userId -Scope "/" -ExpandPrincipalGroups -ErrorAction Stop } catch { Add-AuditIssue -Area 'Azure RBAC' -Message ("Failed to read tenant-root role assignments: {0}" -f $_.Exception.Message) }
 foreach ($ar in $tenantAssignments) {
   $rbacOutput.Add([PSCustomObject]@{
     AppliedAt="Tenant"; ManagementGroupId=$null; SubscriptionId=$null; SubscriptionName=$null;
     RoleDefinitionId=$null; RoleDefinitionName=$ar.RoleDefinitionName; Scope=$ar.Scope;
-    AssignmentState="ActivePermanent"; AssignmentSource="Direct"
+    AssignmentState="ActivePermanent"; AssignmentSource=(Get-AzRoleAssignmentSource $ar)
   })
 }
 
-# Management groups (direct)
-try { $mgList = Get-AzManagementGroup -ErrorAction Stop } catch { $mgList = @() }
+# Management groups (direct + group-inherited)
+$mgList = @()
+try { $mgList = Get-AzManagementGroup -ErrorAction Stop } catch { Add-AuditIssue -Area 'Azure RBAC' -Message ("Failed to enumerate management groups: {0}" -f $_.Exception.Message) }
 foreach ($mg in $mgList) {
   $mgScope = "/providers/Microsoft.Management/managementGroups/$($mg.Name)"
-  try { $mgAssignments = Get-AzRoleAssignment -ObjectId $userId -Scope $mgScope -ErrorAction Stop } catch { $mgAssignments = @() }
+  $mgAssignments = @()
+  try { $mgAssignments = Get-AzRoleAssignment -ObjectId $userId -Scope $mgScope -ExpandPrincipalGroups -ErrorAction Stop } catch { Add-AuditIssue -Area 'Azure RBAC' -Message ("Failed to read role assignments at management group {0}: {1}" -f $mg.Name, $_.Exception.Message) }
   foreach ($ar in $mgAssignments) {
     $rbacOutput.Add([PSCustomObject]@{
       AppliedAt="ManagementGroup"; ManagementGroupId=$mg.Name; SubscriptionId=$null; SubscriptionName=$null;
       RoleDefinitionId=$null; RoleDefinitionName=$ar.RoleDefinitionName; Scope=$ar.Scope;
-      AssignmentState="ActivePermanent"; AssignmentSource="Direct"
+      AssignmentState="ActivePermanent"; AssignmentSource=(Get-AzRoleAssignmentSource $ar)
     })
   }
 }
 
-# Subscriptions & below: classic + PIM schedules
+# Subscriptions & below: classic permanent assignments (direct + group-inherited).
+# Get-AzRoleAssignment has no cross-scope principal filter, so this still loops per
+# subscription; PIM schedules below use a single all-scopes query instead.
 foreach ($sub in $subscriptions) {
   $subScope = "/subscriptions/$($sub.Id)"
-
-  # Classic direct
-  try { $assignmentsAtSubScope = Get-AzRoleAssignment -ObjectId $userId -Scope $subScope -ErrorAction Stop } catch { $assignmentsAtSubScope = @() }
+  $assignmentsAtSubScope = @()
+  try { $assignmentsAtSubScope = Get-AzRoleAssignment -ObjectId $userId -Scope $subScope -ExpandPrincipalGroups -ErrorAction Stop } catch { Add-AuditIssue -Area 'Azure RBAC' -Message ("Failed to read role assignments for subscription {0}: {1}" -f $sub.Name, $_.Exception.Message) }
   foreach ($ar in $assignmentsAtSubScope) {
     $sid = Get-SubscriptionIdFromScope -scope $ar.Scope
     $sname = $null; if ($sid) { $sname = $subNameById[$sid.ToLower()] }
     $rbacOutput.Add([PSCustomObject]@{
       AppliedAt=Get-AppliedAt $ar.Scope; ManagementGroupId=$null; SubscriptionId=$sid; SubscriptionName=$sname;
       RoleDefinitionId=$null; RoleDefinitionName=$ar.RoleDefinitionName; Scope=$ar.Scope;
-      AssignmentState="ActivePermanent"; AssignmentSource="Direct"
+      AssignmentState="ActivePermanent"; AssignmentSource=(Get-AzRoleAssignmentSource $ar)
     })
   }
+}
 
-  # PIM eligible 
-  try { $eligSchedules = Get-AzRoleEligibilitySchedule -Scope $subScope -ErrorAction Stop } catch { $eligSchedules = @() }
-  foreach ($es in $eligSchedules) {
-    $isGroup=$false; $grpName=$null
-    if ($allUserGroupIds -and $es.PrincipalId) {
-      if ($allUserGroupIds -contains $es.PrincipalId) { $isGroup=$true; $grpName=$groupNameById[$es.PrincipalId]; if (-not $grpName) { $grpName=$es.PrincipalId } }
-    }
-    if ($es.PrincipalId -eq $userId -or $isGroup) {
-      $sid = Get-SubscriptionIdFromScope -scope $es.Scope
-      $sname = $null; if ($sid) { $sname = $subNameById[$sid.ToLower()] }
-      $roleName = if ($es.PSObject.Properties.Match('RoleDefinitionName').Count -gt 0 -and $es.RoleDefinitionName) { $es.RoleDefinitionName } else { Resolve-RoleDefName $es.RoleDefinitionId }
-      $rbacOutput.Add([PSCustomObject]@{
-        AppliedAt=Get-AppliedAt $es.Scope; ManagementGroupId=$null; SubscriptionId=$sid; SubscriptionName=$sname;
-        RoleDefinitionId=$es.RoleDefinitionId; RoleDefinitionName=$roleName; Scope=$es.Scope;
-        AssignmentState="Eligible"; AssignmentSource=($isGroup ? "PIM-Group: $grpName" : "Direct")
-      })
-    }
-  }
+# PIM eligibility and active/activated assignment schedules, across ALL scopes (tenant,
+# management groups, subscriptions, resource groups, resources) in a single call each,
+# using the "assignedTo()" filter which server-side expands group membership. This fixes
+# a critical gap in the previous per-subscription loop, which never queried tenant- or
+# management-group-scoped PIM schedules at all.
+$eligSchedules = @()
+try { $eligSchedules = Get-AzRoleEligibilitySchedule -Scope "/" -Filter "assignedTo('$userId')" -ErrorAction Stop } catch { Add-AuditIssue -Area 'Azure RBAC' -Message ("Failed to read role eligibility schedules: {0}" -f $_.Exception.Message) }
+foreach ($es in $eligSchedules) {
+  $isGroup = ($allUserGroupIds -and $es.PrincipalId -and ($allUserGroupIds -contains $es.PrincipalId))
+  $grpName = $null
+  if ($isGroup) { $grpName = $groupNameById[$es.PrincipalId]; if (-not $grpName) { $grpName = $es.PrincipalId } }
+  $sid = Get-SubscriptionIdFromScope -scope $es.Scope
+  $sname = $null; if ($sid) { $sname = $subNameById[$sid.ToLower()] }
+  $mgId = $null
+  if ($es.Scope -like "/providers/Microsoft.Management/managementGroups/*") { $mgId = ($es.Scope -split '/')[-1] }
+  $roleName = if ($es.PSObject.Properties.Match('RoleDefinitionName').Count -gt 0 -and $es.RoleDefinitionName) { $es.RoleDefinitionName } else { Resolve-RoleDefName $es.RoleDefinitionId }
+  $rbacOutput.Add([PSCustomObject]@{
+    AppliedAt=Get-AppliedAt $es.Scope; ManagementGroupId=$mgId; SubscriptionId=$sid; SubscriptionName=$sname;
+    RoleDefinitionId=$es.RoleDefinitionId; RoleDefinitionName=$roleName; Scope=$es.Scope;
+    AssignmentState="Eligible"; AssignmentSource=($isGroup ? "PIM-Group: $grpName" : "Direct")
+  })
+}
 
-  # PIM active (activations) 
-  try { $actSchedules = Get-AzRoleAssignmentSchedule -Scope $subScope -ErrorAction Stop } catch { $actSchedules = @() }
-  foreach ($as in $actSchedules) {
-    $isGroup=$false; $grpName=$null
-    if ($allUserGroupIds -and $as.PrincipalId) {
-      if ($allUserGroupIds -contains $as.PrincipalId) { $isGroup=$true; $grpName=$groupNameById[$as.PrincipalId]; if (-not $grpName) { $grpName=$as.PrincipalId } }
-    }
-    if ($as.PrincipalId -eq $userId -or $isGroup) {
-      $sid = Get-SubscriptionIdFromScope -scope $as.Scope
-      $sname = $null; if ($sid) { $sname = $subNameById[$sid.ToLower()] }
-      $roleName = if ($as.PSObject.Properties.Match('RoleDefinitionName').Count -gt 0 -and $as.RoleDefinitionName) { $as.RoleDefinitionName } else { Resolve-RoleDefName $as.RoleDefinitionId }
-      $state = ($as.EndDateTime) ? "ActiveTimeBound" : "ActivePermanent"
-      $rbacOutput.Add([PSCustomObject]@{
-        AppliedAt=Get-AppliedAt $as.Scope; ManagementGroupId=$null; SubscriptionId=$sid; SubscriptionName=$sname;
-        RoleDefinitionId=$as.RoleDefinitionId; RoleDefinitionName=$roleName; Scope=$as.Scope;
-        AssignmentState=$state; AssignmentSource=($isGroup ? "PIM-Group: $grpName" : "Direct")
-      })
-    }
-  }
+# PIM active (activations), across ALL scopes in a single call (see rationale above).
+$actSchedules = @()
+try { $actSchedules = Get-AzRoleAssignmentSchedule -Scope "/" -Filter "assignedTo('$userId')" -ErrorAction Stop } catch { Add-AuditIssue -Area 'Azure RBAC' -Message ("Failed to read role assignment schedules: {0}" -f $_.Exception.Message) }
+foreach ($as in $actSchedules) {
+  $isGroup = ($allUserGroupIds -and $as.PrincipalId -and ($allUserGroupIds -contains $as.PrincipalId))
+  $grpName = $null
+  if ($isGroup) { $grpName = $groupNameById[$as.PrincipalId]; if (-not $grpName) { $grpName = $as.PrincipalId } }
+  $sid = Get-SubscriptionIdFromScope -scope $as.Scope
+  $sname = $null; if ($sid) { $sname = $subNameById[$sid.ToLower()] }
+  $mgId = $null
+  if ($as.Scope -like "/providers/Microsoft.Management/managementGroups/*") { $mgId = ($as.Scope -split '/')[-1] }
+  $roleName = if ($as.PSObject.Properties.Match('RoleDefinitionName').Count -gt 0 -and $as.RoleDefinitionName) { $as.RoleDefinitionName } else { Resolve-RoleDefName $as.RoleDefinitionId }
+  $state = ($as.EndDateTime) ? "ActiveTimeBound" : "ActivePermanent"
+  $rbacOutput.Add([PSCustomObject]@{
+    AppliedAt=Get-AppliedAt $as.Scope; ManagementGroupId=$mgId; SubscriptionId=$sid; SubscriptionName=$sname;
+    RoleDefinitionId=$as.RoleDefinitionId; RoleDefinitionName=$roleName; Scope=$as.Scope;
+    AssignmentState=$state; AssignmentSource=($isGroup ? "PIM-Group: $grpName" : "Direct")
+  })
 }
 
 # Deduplicate Azure RBAC
@@ -514,8 +566,9 @@ th { background-color: #f3f4f6; text-align: left; }
 "@  # Simple CSS 
 
 $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+$upnEncoded = [System.Net.WebUtility]::HtmlEncode($upn)
 $pageTitle = "Unified Role Report for $upn — $now"
-$header = "<h1>$pageTitle</h1><div class='note'>Generated by PowerShell</div>"
+$header = "<h1>Unified Role Report for $upnEncoded — $now</h1><div class='note'>Generated by PowerShell</div>"
 
 # Build fragments as strings (normalize to non-null) 
 $exoTable = if ($workloadRbac -and $workloadRbac.Count -gt 0) {
@@ -524,7 +577,7 @@ $exoTable = if ($workloadRbac -and $workloadRbac.Count -gt 0) {
     Select-Object Workload, Role, AssignmentSource, Scope, RoleAssigneeType, RoleAssigneeName |
     ConvertTo-Html -As Table -PreContent "<h2>Exchange Online RBAC</h2>" -Fragment  
 } else {
-  "<div class='note'><h2>Exchange Online RBAC</h2>No Exchange Online RBAC entries found for $upn.</div>"
+  "<div class='note'><h2>Exchange Online RBAC</h2>No Exchange Online RBAC entries found for $upnEncoded.</div>"
 }
 
 $entraCombined = @()
@@ -568,6 +621,16 @@ $azureTable = if ($rbacDedup -and $rbacDedup.Count -gt 0) {
   "<div class='note'><h2>Azure RBAC and PIM</h2>No Azure RBAC roles found.</div>"
 }
 
+# Surface any collection warnings/errors instead of letting them disappear into empty
+# catch blocks, so report readers know when a section may be incomplete.
+$issuesTable = if ($script:auditIssues -and $script:auditIssues.Count -gt 0) {
+  $script:auditIssues |
+    Select-Object Area, Message, Timestamp |
+    ConvertTo-Html -As Table -PreContent "<h2>Collection Warnings/Errors</h2>" -Fragment
+} else {
+  "<div class='note'><h2>Collection Warnings/Errors</h2>No collection errors were recorded during this run.</div>"
+}
+
 # Assemble the page
 $html = ConvertTo-Html -Head $style -Title $pageTitle -PreContent $header -Body @"
 <div class='section'>
@@ -584,6 +647,9 @@ $pimGroupsCompactTable
 </div>
 <div class='section'>
 $azureTable
+</div>
+<div class='section'>
+$issuesTable
 </div>
 "@  
 
@@ -615,21 +681,25 @@ try {
 $exportFolder = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 try {
   if (-not (Test-Path -LiteralPath $exportFolder)) { New-Item -ItemType Directory -Path $exportFolder -Force | Out-Null }
-} catch {}
+} catch {
+  Add-AuditIssue -Area 'Export' -Message ("Failed to create export folder {0}: {1}" -f $exportFolder, $_.Exception.Message)
+}
 
 $ts = (Get-Date).ToString("yyyyMMdd_HHmmss")
-function Safe-ExportCsv($obj, [string]$path) {
+# Writes a CSV with a stable header even when $obj is empty (Export-Csv otherwise creates
+# no file at all for an empty collection, which previously produced misleading "no data"
+# CSVs with no columns to distinguish "empty" from "query failed").
+function Safe-ExportCsv($obj, [string[]]$columns, [string]$path) {
   try {
-    if ($obj -and $obj.Count -gt 0) {
+    if ($obj -and @($obj).Count -gt 0) {
       $obj | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
       Write-Host ("CSV written: {0}" -f $path) -ForegroundColor Green
     } else {
-      # Write empty CSV with headers if possible
-      $obj | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
-      Write-Host ("CSV created (empty): {0}" -f $path) -ForegroundColor Yellow
+      ($columns -join ',') | Out-File -FilePath $path -Encoding UTF8
+      Write-Host ("CSV created (empty, header only): {0}" -f $path) -ForegroundColor Yellow
     }
   } catch {
-    Write-Host ("Failed to write CSV {0}: {1}" -f $path, $_.Exception.Message) -ForegroundColor Yellow
+    Add-AuditIssue -Area 'Export' -Message ("Failed to write CSV {0}: {1}" -f $path, $_.Exception.Message)
   }
 }
 
@@ -642,12 +712,13 @@ $csv_PIM_C = $pimGroupCompact | Sort-Object GroupName, MembershipState | Select-
 $csv_AZRB  = $rbacDedup | Sort-Object AppliedAt, SubscriptionName, AssignmentSource, AssignmentState, RoleDefinitionName, Scope |
             Select-Object AppliedAt, SubscriptionId, SubscriptionName, RoleDefinitionName, RoleDefinitionId, AssignmentState, AssignmentSource, Scope  
 
-Safe-ExportCsv $csv_EXO   (Join-Path $exportFolder ("Exchange_RBAC_{0}.csv" -f $ts))
-Safe-ExportCsv $csv_ER_As (Join-Path $exportFolder ("Entra_Roles_Assigned_{0}.csv" -f $ts))
-Safe-ExportCsv $csv_ER_El (Join-Path $exportFolder ("Entra_Roles_Eligible_{0}.csv" -f $ts))
-Safe-ExportCsv $csv_PIM_D (Join-Path $exportFolder ("PIM_Groups_Detailed_{0}.csv" -f $ts))
-Safe-ExportCsv $csv_PIM_C (Join-Path $exportFolder ("PIM_Groups_Compact_{0}.csv" -f $ts))
-Safe-ExportCsv $csv_AZRB  (Join-Path $exportFolder ("Azure_RBAC_{0}.csv" -f $ts))
+Safe-ExportCsv $csv_EXO   @('Workload','Role','AssignmentSource','Scope','RoleAssigneeType','RoleAssigneeName') (Join-Path $exportFolder ("Exchange_RBAC_{0}.csv" -f $ts))
+Safe-ExportCsv $csv_ER_As @('Type','Role') (Join-Path $exportFolder ("Entra_Roles_Assigned_{0}.csv" -f $ts))
+Safe-ExportCsv $csv_ER_El @('Type','Role') (Join-Path $exportFolder ("Entra_Roles_Eligible_{0}.csv" -f $ts))
+Safe-ExportCsv $csv_PIM_D @('GroupName','GroupId','MembershipState','EntraRoleType','EntraRole') (Join-Path $exportFolder ("PIM_Groups_Detailed_{0}.csv" -f $ts))
+Safe-ExportCsv $csv_PIM_C @('GroupName','GroupId','MembershipState','PermanentRoles','EligibleRoles') (Join-Path $exportFolder ("PIM_Groups_Compact_{0}.csv" -f $ts))
+Safe-ExportCsv $csv_AZRB  @('AppliedAt','SubscriptionId','SubscriptionName','RoleDefinitionName','RoleDefinitionId','AssignmentState','AssignmentSource','Scope') (Join-Path $exportFolder ("Azure_RBAC_{0}.csv" -f $ts))
+Safe-ExportCsv $script:auditIssues @('Area','Message','Timestamp') (Join-Path $exportFolder ("Collection_Issues_{0}.csv" -f $ts))
 
 Write-Host ("All CSVs saved under: {0}" -f $exportFolder) -ForegroundColor Cyan
 
