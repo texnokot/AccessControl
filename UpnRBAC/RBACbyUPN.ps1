@@ -53,6 +53,31 @@ function Add-AuditIssue {
   Write-Host ("[{0}] {1}" -f $Area, $Message) -ForegroundColor DarkYellow
 }
 
+# Wraps known, script-controlled cell values (assignment source/state, membership
+# state) in colored <span> "chip" markup after ConvertTo-Html has already HTML-encoded
+# the fragment. This only rewrites literal, well-known tokens the script itself emits
+# (e.g. "Direct", "Active", "Group: <name>") — it never touches free-form user input,
+# so it can't be used to inject markup via a crafted UPN or display name.
+function Format-Badges {
+  param([Parameter(Mandatory=$true)][string]$Html)
+  $map = @(
+    @{ Pattern = '<td>Direct</td>';               Class = 'chip chip-direct';  Text = 'Direct' }
+    @{ Pattern = '<td>(Group: [^<]+)</td>';        Class = 'chip chip-group' }
+    @{ Pattern = '<td>(PIM-Group: [^<]+)</td>';    Class = 'chip chip-pim' }
+    @{ Pattern = '<td>Active</td>';                Class = 'chip chip-active'; Text = 'Active' }
+    @{ Pattern = '<td>Eligible</td>';              Class = 'chip chip-eligible'; Text = 'Eligible' }
+    @{ Pattern = '<td>Assigned</td>';              Class = 'chip chip-active'; Text = 'Assigned' }
+  )
+  foreach ($m in $map) {
+    if ($m.Text) {
+      $Html = $Html -replace [regex]::Escape("<td>$($m.Text)</td>"), "<td><span class=`"$($m.Class)`">$($m.Text)</span></td>"
+    } else {
+      $Html = $Html -replace $m.Pattern, "<td><span class=`"$($m.Class)`">`$1</span></td>"
+    }
+  }
+  return $Html
+}
+
 # -------------------- Input with guard --------------------
 $upn = Read-Host "Enter User Principal Name (UPN)"
 if ([string]::IsNullOrWhiteSpace($upn)) {
@@ -552,106 +577,282 @@ $rbacDedup = foreach ($e in $rbacOutput) {
 }
 
 # -------------------- HTML report --------------------
+# Modern, self-contained (no external CDN/network calls) report styling: CSS custom
+# properties with an automatic + manual dark mode, a sticky nav, a summary dashboard,
+# collapsible cards, colored status chips, and a lightweight per-table search filter.
 $style = @"
 <style>
-body { font-family: Segoe UI, Arial, Helvetica, sans-serif; margin: 20px; }
-h1 { font-size: 20px; margin-bottom: 8px; }
-h2 { font-size: 16px; margin-top: 20px; margin-bottom: 6px; }
+:root {
+  color-scheme: light dark;
+  --bg: #f5f6fb; --bg-elevated: #ffffff; --text: #1c1e29; --text-muted: #5b5f73;
+  --border: #e2e4ec; --accent: #5b5bf0; --accent-soft: #eceafd;
+  --shadow: 0 1px 2px rgba(20,20,43,.04), 0 8px 24px rgba(20,20,43,.06);
+  --chip-direct-bg: #e7f0ff; --chip-direct-fg: #1d4ed8;
+  --chip-group-bg: #f1e9fe; --chip-group-fg: #7c3aed;
+  --chip-pim-bg: #fff1e0; --chip-pim-fg: #c2600a;
+  --chip-active-bg: #e3f8ec; --chip-active-fg: #157347;
+  --chip-eligible-bg: #fff8dd; --chip-eligible-fg: #9a7d05;
+}
+[data-theme="dark"] {
+  --bg: #12131c; --bg-elevated: #191b27; --text: #eceef5; --text-muted: #9a9db0;
+  --border: #2a2d3d; --accent: #8b8bff; --accent-soft: #23233f;
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+  --chip-direct-bg: #16233f; --chip-direct-fg: #93b6ff;
+  --chip-group-bg: #2a1f42; --chip-group-fg: #c9a6ff;
+  --chip-pim-bg: #3a2712; --chip-pim-fg: #ffbf76;
+  --chip-active-bg: #123424; --chip-active-fg: #6fe0a0;
+  --chip-eligible-bg: #362e0a; --chip-eligible-fg: #e6cd5c;
+}
+* { box-sizing: border-box; }
+body {
+  font-family: "Segoe UI", "Inter", system-ui, -apple-system, Arial, sans-serif;
+  margin: 0; background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.45;
+}
+a { color: var(--accent); }
+.topbar {
+  position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 16px;
+  padding: 10px 24px; background: var(--bg-elevated); border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow); flex-wrap: wrap;
+}
+.topbar .brand { font-weight: 600; margin-right: auto; white-space: nowrap; }
+.topbar nav a {
+  text-decoration: none; color: var(--text-muted); font-size: 13px; padding: 6px 10px;
+  border-radius: 8px;
+}
+.topbar nav a:hover { background: var(--accent-soft); color: var(--accent); }
+.theme-toggle {
+  border: 1px solid var(--border); background: var(--bg); color: var(--text); cursor: pointer;
+  border-radius: 8px; padding: 6px 12px; font-size: 13px;
+}
+.hero { padding: 28px 24px 8px; }
+.hero h1 { font-size: 22px; margin: 0 0 4px; }
+.hero .meta { color: var(--text-muted); font-size: 13px; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px 40px; }
+.summary-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px;
+  margin: 20px 0 28px;
+}
+.stat-card {
+  background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 14px;
+  padding: 16px 18px; box-shadow: var(--shadow);
+}
+.stat-card .num { font-size: 26px; font-weight: 700; }
+.stat-card .label { color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.stat-card.warn .num { color: #c2600a; }
+.stat-card.ok .num { color: #157347; }
+.card {
+  background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden;
+}
+.card > summary, .card > .card-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 14px 18px; cursor: pointer; list-style: none; font-weight: 600; font-size: 15px;
+}
+.card > summary::-webkit-details-marker { display: none; }
+.card > summary::before { content: "▸"; margin-right: 8px; color: var(--text-muted); }
+.card[open] > summary::before { content: "▾"; }
+.card .count-badge {
+  background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 700;
+  padding: 2px 9px; border-radius: 999px;
+}
+.card-body { padding: 0 18px 18px; }
+.filter-input {
+  width: 100%; margin-bottom: 10px; padding: 8px 12px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--bg); color: var(--text); font-size: 13px;
+}
+.table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
 table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #ddd; padding: 6px 8px; font-size: 12px; }
-th { background-color: #f3f4f6; text-align: left; }
-.section { margin-bottom: 24px; }
-.note { color: #555; font-size: 12px; }
+th, td { padding: 8px 12px; font-size: 12.5px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { background: var(--accent-soft); color: var(--text); font-weight: 600; position: sticky; top: 0; }
+tbody tr:hover { background: var(--accent-soft); }
+tbody tr.filtered-out { display: none; }
+.note { color: var(--text-muted); font-size: 13px; padding: 4px 0; }
+.chip { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
+.chip-direct   { background: var(--chip-direct-bg);   color: var(--chip-direct-fg); }
+.chip-group    { background: var(--chip-group-bg);    color: var(--chip-group-fg); }
+.chip-pim      { background: var(--chip-pim-bg);      color: var(--chip-pim-fg); }
+.chip-active   { background: var(--chip-active-bg);   color: var(--chip-active-fg); }
+.chip-eligible { background: var(--chip-eligible-bg); color: var(--chip-eligible-fg); }
+footer { color: var(--text-muted); font-size: 12px; text-align: center; padding: 24px 0 8px; }
+@media print {
+  .topbar, .filter-input { display: none; }
+  .card { break-inside: avoid; box-shadow: none; }
+  body { background: #fff; }
+}
 </style>
-"@  # Simple CSS 
+"@
 
 $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 $upnEncoded = [System.Net.WebUtility]::HtmlEncode($upn)
 $pageTitle = "Unified Role Report for $upn — $now"
-$header = "<h1>Unified Role Report for $upnEncoded — $now</h1><div class='note'>Generated by PowerShell</div>"
 
-# Build fragments as strings (normalize to non-null) 
-$exoTable = if ($workloadRbac -and $workloadRbac.Count -gt 0) {
-  $workloadRbac |
+# Build fragments as strings (normalize to non-null), then wrap in a collapsible
+# "card" with an anchor id (for the nav), a row count badge, and a search box.
+function New-ReportCard {
+  param(
+    [Parameter(Mandatory=$true)][string]$Id,
+    [Parameter(Mandatory=$true)][string]$Title,
+    [Parameter(Mandatory=$true)][int]$Count,
+    [Parameter(Mandatory=$true)][string]$BodyHtml,
+    [switch]$Open
+  )
+  $openAttr = if ($Open -or $Count -gt 0) { " open" } else { "" }
+  $filterBox = if ($Count -gt 0) { "<input type='text' class='filter-input' placeholder='Filter rows in $([System.Net.WebUtility]::HtmlEncode($Title))...' oninput=`"filterTable(this)`" />" } else { "" }
+  @"
+<details class='card' id='$Id'$openAttr>
+<summary>$Title <span class='count-badge'>$Count</span></summary>
+<div class='card-body'>
+$filterBox
+$BodyHtml
+</div>
+</details>
+"@
+}
+
+$exoCount = if ($workloadRbac) { $workloadRbac.Count } else { 0 }
+$exoTable = if ($exoCount -gt 0) {
+  $body = $workloadRbac |
     Sort-Object Workload, Role, AssignmentSource, Scope |
     Select-Object Workload, Role, AssignmentSource, Scope, RoleAssigneeType, RoleAssigneeName |
-    ConvertTo-Html -As Table -PreContent "<h2>Exchange Online RBAC</h2>" -Fragment  
+    ConvertTo-Html -As Table -Fragment
+  Format-Badges "<div class='table-scroll'>$body</div>"
 } else {
-  "<div class='note'><h2>Exchange Online RBAC</h2>No Exchange Online RBAC entries found for $upnEncoded.</div>"
+  "<div class='note'>No Exchange Online RBAC entries found for $upnEncoded.</div>"
 }
 
 $entraCombined = @()
 if ($entraAssigned) { $entraCombined += $entraAssigned }
 if ($entraEligible) { $entraCombined += $entraEligible }
-$entraTable = if ($entraCombined -and $entraCombined.Count -gt 0) {
-  $entraCombined |
+$entraCount = $entraCombined.Count
+$entraTable = if ($entraCount -gt 0) {
+  $body = $entraCombined |
     Sort-Object Type, Role |
     Select-Object Type, Role |
-    ConvertTo-Html -As Table -PreContent "<h2>Entra ID Directory Roles</h2>" -Fragment 
+    ConvertTo-Html -As Table -Fragment
+  Format-Badges "<div class='table-scroll'>$body</div>"
 } else {
-  "<div class='note'><h2>Entra ID Directory Roles</h2>No Entra ID directory roles.</div>"
+  "<div class='note'>No Entra ID directory roles.</div>"
 }
 
-# Detailed PIM Groups & Roles table 
-$pimGroupsTable = if ($pimGroupUnique -and $pimGroupUnique.Count -gt 0) {
-  $pimGroupUnique |
+# Detailed PIM Groups & Roles table
+$pimCount = if ($pimGroupUnique) { $pimGroupUnique.Count } else { 0 }
+$pimGroupsTable = if ($pimCount -gt 0) {
+  $body = $pimGroupUnique |
     Sort-Object GroupName, MembershipState, EntraRoleType, EntraRole |
     Select-Object GroupName, GroupId, MembershipState, EntraRoleType, EntraRole |
-    ConvertTo-Html -As Table -PreContent "<h2>PIM Groups & Roles (Detailed)</h2>" -Fragment
+    ConvertTo-Html -As Table -Fragment
+  Format-Badges "<div class='table-scroll'>$body</div>"
 } else {
-  "<div class='note'><h2>PIM Groups & Roles (Detailed)</h2>No PIM group memberships or assigned roles.</div>"
+  "<div class='note'>No PIM group memberships or assigned roles.</div>"
 }
 
-# Compact grouped PIM summary (enrichment) 
-$pimGroupsCompactTable = if ($pimGroupCompact -and $pimGroupCompact.Count -gt 0) {
-  $pimGroupCompact |
+# Compact grouped PIM summary (enrichment)
+$pimCompactCount = if ($pimGroupCompact) { $pimGroupCompact.Count } else { 0 }
+$pimGroupsCompactTable = if ($pimCompactCount -gt 0) {
+  $body = $pimGroupCompact |
     Sort-Object GroupName, MembershipState |
     Select-Object GroupName, GroupId, MembershipState, PermanentRoles, EligibleRoles |
-    ConvertTo-Html -As Table -PreContent "<h2>PIM Groups & Roles (Compact Summary)</h2>" -Fragment
+    ConvertTo-Html -As Table -Fragment
+  Format-Badges "<div class='table-scroll'>$body</div>"
 } else {
-  "<div class='note'><h2>PIM Groups & Roles (Compact Summary)</h2>No PIM group memberships or roles.</div>"
+  "<div class='note'>No PIM group memberships or roles.</div>"
 }
 
-$azureTable = if ($rbacDedup -and $rbacDedup.Count -gt 0) {
-  $rbacDedup |
+$azureCount = if ($rbacDedup) { $rbacDedup.Count } else { 0 }
+$azureTable = if ($azureCount -gt 0) {
+  $body = $rbacDedup |
     Sort-Object AppliedAt, SubscriptionName, AssignmentSource, AssignmentState, RoleDefinitionName, Scope |
     Select-Object AppliedAt, SubscriptionId, SubscriptionName, RoleDefinitionName, RoleDefinitionId, AssignmentState, AssignmentSource, Scope |
-    ConvertTo-Html -As Table -PreContent "<h2>Azure RBAC and PIM</h2>" -Fragment  
+    ConvertTo-Html -As Table -Fragment
+  Format-Badges "<div class='table-scroll'>$body</div>"
 } else {
-  "<div class='note'><h2>Azure RBAC and PIM</h2>No Azure RBAC roles found.</div>"
+  "<div class='note'>No Azure RBAC roles found.</div>"
 }
 
 # Surface any collection warnings/errors instead of letting them disappear into empty
 # catch blocks, so report readers know when a section may be incomplete.
-$issuesTable = if ($script:auditIssues -and $script:auditIssues.Count -gt 0) {
-  $script:auditIssues |
+$issuesCount = if ($script:auditIssues) { $script:auditIssues.Count } else { 0 }
+$issuesTable = if ($issuesCount -gt 0) {
+  $body = $script:auditIssues |
     Select-Object Area, Message, Timestamp |
-    ConvertTo-Html -As Table -PreContent "<h2>Collection Warnings/Errors</h2>" -Fragment
+    ConvertTo-Html -As Table -Fragment
+  "<div class='table-scroll'>$body</div>"
 } else {
-  "<div class='note'><h2>Collection Warnings/Errors</h2>No collection errors were recorded during this run.</div>"
+  "<div class='note'>No collection errors were recorded during this run.</div>"
 }
 
+$issuesCardClass = if ($issuesCount -gt 0) { "warn" } else { "ok" }
+$summaryGrid = @"
+<div class='summary-grid'>
+  <div class='stat-card'><div class='num'>$exoCount</div><div class='label'>Exchange Online</div></div>
+  <div class='stat-card'><div class='num'>$entraCount</div><div class='label'>Entra ID Roles</div></div>
+  <div class='stat-card'><div class='num'>$pimCount</div><div class='label'>PIM Group Roles</div></div>
+  <div class='stat-card'><div class='num'>$azureCount</div><div class='label'>Azure RBAC</div></div>
+  <div class='stat-card $issuesCardClass'><div class='num'>$issuesCount</div><div class='label'>Collection Issues</div></div>
+</div>
+"@
+
+$header = @"
+<div class='topbar'>
+  <span class='brand'>🛡️ Unified Role Report</span>
+  <nav>
+    <a href='#exo'>Exchange</a>
+    <a href='#entra'>Entra ID</a>
+    <a href='#pim'>PIM Groups</a>
+    <a href='#pim-compact'>PIM Summary</a>
+    <a href='#azure'>Azure RBAC</a>
+    <a href='#issues'>Issues</a>
+  </nav>
+  <button class='theme-toggle' onclick='toggleTheme()' type='button'>🌓 Theme</button>
+</div>
+<div class='hero'>
+  <h1>$upnEncoded</h1>
+  <div class='meta'>Generated $now &middot; PowerShell RBAC audit</div>
+</div>
+"@
+
+$bodyContent = @"
+<div class='wrap'>
+$summaryGrid
+$(New-ReportCard -Id 'exo' -Title 'Exchange Online RBAC' -Count $exoCount -BodyHtml $exoTable -Open)
+$(New-ReportCard -Id 'entra' -Title 'Entra ID Directory Roles' -Count $entraCount -BodyHtml $entraTable -Open)
+$(New-ReportCard -Id 'pim' -Title 'PIM Groups & Roles (Detailed)' -Count $pimCount -BodyHtml $pimGroupsTable)
+$(New-ReportCard -Id 'pim-compact' -Title 'PIM Groups & Roles (Compact Summary)' -Count $pimCompactCount -BodyHtml $pimGroupsCompactTable)
+$(New-ReportCard -Id 'azure' -Title 'Azure RBAC and PIM' -Count $azureCount -BodyHtml $azureTable -Open)
+$(New-ReportCard -Id 'issues' -Title 'Collection Warnings/Errors' -Count $issuesCount -BodyHtml $issuesTable)
+<footer>Unified Role Report &middot; generated locally by RBACbyUPN.ps1 &middot; no data leaves this machine</footer>
+</div>
+<script>
+function toggleTheme() {
+  var root = document.documentElement;
+  var current = root.getAttribute('data-theme');
+  var next = current === 'dark' ? 'light' : 'dark';
+  root.setAttribute('data-theme', next);
+  try { localStorage.setItem('rbacReportTheme', next); } catch (e) {}
+}
+(function () {
+  try {
+    var saved = localStorage.getItem('rbacReportTheme');
+    if (saved) { document.documentElement.setAttribute('data-theme', saved); }
+    else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+  } catch (e) {}
+})();
+function filterTable(input) {
+  var card = input.closest('.card-body');
+  var rows = card.querySelectorAll('table tbody tr');
+  var term = input.value.trim().toLowerCase();
+  rows.forEach(function (row) {
+    var match = !term || row.textContent.toLowerCase().indexOf(term) !== -1;
+    row.classList.toggle('filtered-out', !match);
+  });
+}
+</script>
+"@
+
 # Assemble the page
-$html = ConvertTo-Html -Head $style -Title $pageTitle -PreContent $header -Body @"
-<div class='section'>
-$exoTable
-</div>
-<div class='section'>
-$entraTable
-</div>
-<div class='section'>
-$pimGroupsTable
-</div>
-<div class='section'>
-$pimGroupsCompactTable
-</div>
-<div class='section'>
-$azureTable
-</div>
-<div class='section'>
-$issuesTable
-</div>
-"@  
+$html = ConvertTo-Html -Head $style -Title $pageTitle -PreContent $header -Body $bodyContent
 
 # Cross-platform temp directory and opener
 if ($IsWindows) {
